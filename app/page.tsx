@@ -1,14 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PageCanvas, PagePreview } from "@/components/PagePreview";
 import { RichEditor } from "@/components/RichEditor";
 import { downloadCurrentPageAsPng, exportBundleAsZip } from "@/lib/browser-export";
 import { normalizeHexColor } from "@/lib/color";
+import { checkCompliance } from "@/lib/compliance";
 import { createDraftProject, getTemplate, TEMPLATES } from "@/lib/defaults";
 import { applyGlobalTextColor } from "@/lib/doc";
 import { createId } from "@/lib/id";
+import { paginateDoc } from "@/lib/paginate";
 import { BACKGROUND_PRESETS } from "@/lib/presets";
+import { buildSuggestions } from "@/lib/suggestions";
 import type { InlineNode, PageRender, Project, RichDoc, ThemeVars } from "@/lib/types";
 
 interface ComplianceIssue {
@@ -22,10 +25,6 @@ interface Suggestions {
   tags: string[];
 }
 
-interface ErrorPayload {
-  error?: string;
-}
-
 function filterByKeyword<T>(
   items: T[],
   keyword: string,
@@ -37,19 +36,6 @@ function filterByKeyword<T>(
   }
 
   return items.filter((item) => getSearchText(item).toLowerCase().includes(normalizedKeyword));
-}
-
-async function requestJson<T extends ErrorPayload>(
-  input: RequestInfo | URL,
-  init: RequestInit | undefined,
-  fallbackMessage: string
-): Promise<T> {
-  const response = await fetch(input, init);
-  const payload = (await response.json()) as T;
-  if (!response.ok) {
-    throw new Error(payload.error || fallbackMessage);
-  }
-  return payload;
 }
 
 function normalizeProject(project: Project): Project {
@@ -149,56 +135,34 @@ export default function HomePage() {
     [presetKeyword]
   );
 
-  const recalc = useCallback(async (docProject: Project) => {
-    const [paginatePayload, compliancePayload, suggestionPayload] = await Promise.all([
-      requestJson<{ pages: PageRender[]; warnings: string[]; error?: string }>(
-        "/api/paginate",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            doc: docProject.doc,
-            templateId: docProject.templateId,
-            themeVars: docProject.themeVars
-          })
-        },
-        "分页失败"
-      ),
-      requestJson<{ issues: ComplianceIssue[]; error?: string }>(
-        "/api/compliance/check",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ doc: docProject.doc })
-        },
-        "合规检查失败"
-      ),
-      requestJson<Suggestions & { error?: string }>(
-        "/api/suggestions",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ doc: docProject.doc })
-        },
-        "建议生成失败"
-      )
-    ]);
+  const recalc = useCallback((docProject: Project) => {
+    const paginateResult = paginateDoc({
+      doc: docProject.doc,
+      template: getTemplate(docProject.templateId),
+      theme: docProject.themeVars
+    });
+    const complianceIssues = checkCompliance(docProject.doc);
+    const suggestionResult = buildSuggestions(docProject.doc);
 
-    setPages(paginatePayload.pages || []);
-    setWarnings(paginatePayload.warnings || []);
-    setIssues(compliancePayload.issues || []);
-    setSuggestions({
-      titles: suggestionPayload.titles ?? [],
-      tags: suggestionPayload.tags ?? []
+    startTransition(() => {
+      setPages(paginateResult.pages || []);
+      setWarnings(paginateResult.warnings || []);
+      setIssues(complianceIssues || []);
+      setSuggestions({
+        titles: suggestionResult.titles ?? [],
+        tags: suggestionResult.tags ?? []
+      });
     });
   }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      void recalc(project).catch((error) => {
+      try {
+        recalc(project);
+      } catch (error) {
         setMessage(error instanceof Error ? error.message : "预览计算失败");
-      });
-    }, 180);
+      }
+    }, 60);
 
     return () => {
       window.clearTimeout(timer);
